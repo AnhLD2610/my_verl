@@ -239,6 +239,96 @@ def _compute_embeds_with_noise(
 # end_modify
 
 
+# start_modify: helper function for hidden state reward bonus computation
+def _compute_hidden_state_reward_bonus(
+    hidden_states: list,
+    input_ids: torch.Tensor,
+    response_ids: torch.Tensor,
+    special_token_id: int,
+    eos_token_id: int,
+    alpha: float = 0.1,
+) -> torch.Tensor:
+    """
+    Compute reward bonus based on dot product of hidden states:
+    bonus = alpha * (z · eos) * 0.1
+    
+    Args:
+        hidden_states: List of hidden states from SGLang, each element is 
+                       [num_tokens, hidden_dim] for last layer (after processing)
+        input_ids: Input token IDs, shape (batch_size, prompt_length)
+        response_ids: Generated response token IDs, shape (batch_size, response_length)
+        special_token_id: Token ID of the special token (z)
+        eos_token_id: Token ID of the EOS token
+        alpha: Coefficient for reward bonus (default 0.1)
+        
+    Returns:
+        Tensor of shape (batch_size,) containing reward bonus for each sample
+    """
+    batch_size = len(hidden_states)
+    device = input_ids.device
+    bonus = torch.zeros(batch_size, device=device, dtype=torch.float32)
+    
+    for i in range(batch_size):
+        # hidden_states[i] contains hidden states for the full sequence (prompt + response)
+        # Shape: [total_seq_len, hidden_dim]
+        hs = hidden_states[i]
+        if not isinstance(hs, torch.Tensor):
+            hs = torch.tensor(hs, device=device, dtype=torch.float32)
+        
+        # Find position of special token in input_ids
+        # Get all positions where special_token appears
+        special_positions = (input_ids[i] == special_token_id).nonzero(as_tuple=True)[0]
+        
+        if len(special_positions) == 0:
+            # No special token found, skip
+            continue
+        
+        # Use the first occurrence of special token
+        special_pos = special_positions[0].item()
+        
+        # Find position of EOS in response (last token of response)
+        # The EOS is typically the last non-padding token in response
+        response_length = response_ids[i].shape[0]
+        
+        # Find the last EOS token in response
+        eos_positions = (response_ids[i] == eos_token_id).nonzero(as_tuple=True)[0]
+        if len(eos_positions) > 0:
+            # EOS found, use its position (relative to response start)
+            eos_pos_in_response = eos_positions[-1].item()  # last EOS
+        else:
+            # No EOS found, use last token position
+            eos_pos_in_response = response_length - 1
+        
+        # The EOS position in full hidden states = prompt_length + eos_pos_in_response
+        prompt_length = input_ids[i].shape[0]
+        # Handle left padding: find first non-pad token
+        non_pad_positions = (input_ids[i] != 0).nonzero(as_tuple=True)[0]
+        if len(non_pad_positions) > 0:
+            actual_prompt_start = non_pad_positions[0].item()
+            actual_prompt_len = prompt_length - actual_prompt_start
+        else:
+            actual_prompt_len = prompt_length
+        
+        eos_pos_in_hs = actual_prompt_len + eos_pos_in_response
+        
+        # Bounds check
+        if special_pos >= len(hs) or eos_pos_in_hs >= len(hs):
+            continue
+        
+        # Extract hidden states
+        z = hs[special_pos - actual_prompt_start] if special_pos >= actual_prompt_start else hs[0]
+        eos_hs = hs[eos_pos_in_hs]
+        
+        # Compute dot product: z · eos
+        dot_product = torch.dot(z.flatten(), eos_hs.flatten())
+        
+        # Compute bonus: alpha * dot_product * 0.1
+        bonus[i] = alpha * dot_product * 0.1
+    
+    return bonus
+# end_modify
+
+
 def _extract_logprob_from_output(output):
     """
     extract log_prob from single sglang inference output
@@ -814,7 +904,9 @@ class SGLangRollout(BaseRollout):
 
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
-            # start_modify: conditional call based on input mode
+            # start_modify: conditional call based on input mode and hidden states
+            return_hidden_states = self.config.get("return_hidden_states", False)
+            
             if use_input_embeds and input_embeds_list is not None:
                 output = loop.run_until_complete(
                     self._engine.async_generate(
@@ -823,6 +915,7 @@ class SGLangRollout(BaseRollout):
                         return_logprob=True,
                         input_embeds=input_embeds_list,  # use input_embeds instead of input_ids
                         image_data=image_list,
+                        return_hidden_states=return_hidden_states,
                     )
                 )
             else:
@@ -833,6 +926,7 @@ class SGLangRollout(BaseRollout):
                         return_logprob=True,
                         input_ids=idx_list,
                         image_data=image_list,
+                        return_hidden_states=return_hidden_states,
                     )
                 )
             # end_modify
@@ -902,7 +996,53 @@ class SGLangRollout(BaseRollout):
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        # start_modify: extract hidden states and compute reward bonus
+        result_meta_info = {}
+        return_hidden_states = self.config.get("return_hidden_states", False)
+        if return_hidden_states and output is not None:
+            try:
+                # Extract hidden states from SGLang output
+                # SGLang returns hidden_states in meta_info of each response
+                hidden_states_list = []
+                for resp in output:
+                    if "meta_info" in resp and "hidden_states" in resp["meta_info"]:
+                        # Get last layer hidden states
+                        hs = resp["meta_info"]["hidden_states"]
+                        if isinstance(hs, list) and len(hs) > 0:
+                            # hs is typically [num_tokens, num_layers, hidden_dim] or similar
+                            # We want the last layer: hs[:, -1, :]
+                            hs_tensor = torch.tensor(hs, device=idx.device, dtype=torch.float32)
+                            if hs_tensor.dim() == 3:
+                                # Shape: [num_tokens, num_layers, hidden_dim] -> use last layer
+                                hidden_states_list.append(hs_tensor[:, -1, :])
+                            else:
+                                hidden_states_list.append(hs_tensor)
+                        else:
+                            hidden_states_list.append(None)
+                    else:
+                        hidden_states_list.append(None)
+                
+                # Compute reward bonus if we have valid hidden states
+                if all(hs is not None for hs in hidden_states_list):
+                    special_token_id = self.config.get("special_token_id", None)
+                    alpha = self.config.get("hidden_state_reward_alpha", 0.1)
+                    
+                    if special_token_id is not None:
+                        hidden_state_bonus = _compute_hidden_state_reward_bonus(
+                            hidden_states=hidden_states_list,
+                            input_ids=idx,
+                            response_ids=response,
+                            special_token_id=special_token_id,
+                            eos_token_id=eos_token_id,
+                            alpha=alpha,
+                        )
+                        result_meta_info["hidden_state_reward_bonus"] = hidden_state_bonus
+                        logger.info(f"Computed hidden state reward bonus: mean={hidden_state_bonus.mean().item():.4f}")
+            except Exception as e:
+                logger.warning(f"Failed to extract hidden states or compute bonus: {e}")
+        # end_modify
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=result_meta_info)
 
     async def _async_rollout_a_request(
         self,

@@ -205,6 +205,10 @@ class RolloutConfig(BaseConfig):
     special_token_id: Optional[int] = None
     # Standard deviation of Gaussian noise N(0, noise_std) to add to special token embeddings
     noise_std: float = 1.0
+    # If True, request hidden states from SGLang for computing reward bonus
+    return_hidden_states: bool = False
+    # Alpha coefficient for hidden state reward bonus: reward += alpha * (z · eos) * 0.1
+    hidden_state_reward_alpha: float = 0.1
     # end_modify
 
     def __post_init__(self):

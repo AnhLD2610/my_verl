@@ -1158,6 +1158,26 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # start_modify: add hidden state reward bonus
+                        # Check if hidden_state_reward_bonus exists in gen_batch_output
+                        if "hidden_state_reward_bonus" in gen_batch_output.meta_info:
+                            hidden_bonus = gen_batch_output.meta_info["hidden_state_reward_bonus"]
+                            if hidden_bonus is not None:
+                                # Add bonus to the last position of reward (outcome reward position)
+                                # reward_tensor shape: (batch_size, response_length)
+                                # bonus shape: (batch_size,)
+                                hidden_bonus = hidden_bonus.to(reward_tensor.device)
+                                # Find last valid position for each sample using response_mask
+                                response_mask = batch.batch["response_mask"]
+                                # Add bonus to the last token position
+                                last_positions = response_mask.sum(dim=-1).long() - 1
+                                last_positions = last_positions.clamp(min=0)
+                                for i in range(reward_tensor.shape[0]):
+                                    batch.batch["token_level_scores"][i, last_positions[i]] += hidden_bonus[i]
+                                # Log the bonus for debugging
+                                print(f"[Hidden State Bonus] Added mean={hidden_bonus.mean().item():.4f} to rewards")
+                        # end_modify
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
