@@ -686,7 +686,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # start_modify: compute input_embeds with noise before offloading model
         use_input_embeds = getattr(self.config.rollout, "use_input_embeds", False)
         if use_input_embeds and self._is_actor:
-            from verl.workers.rollout.sglang_rollout.sglang_rollout import _compute_embeds_with_noise
+            from verl.workers.rollout.vllm_rollout.vllm_rollout_spmd import _compute_embeds_with_noise
             
             special_token_id = getattr(self.config.rollout, "special_token_id", None)
             noise_std = getattr(self.config.rollout, "noise_std", 1.0)

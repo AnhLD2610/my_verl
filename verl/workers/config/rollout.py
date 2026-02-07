@@ -198,15 +198,15 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
-    # start_modify: config for input_embeds with noise injection
+    # start_modify: config for input_embeds with noise injection and hidden state reward
     # If True, use input_embeds instead of input_ids for generation
     use_input_embeds: bool = False
     # Token ID of the special token to inject noise into (e.g., a separator token)
     special_token_id: Optional[int] = None
     # Standard deviation of Gaussian noise N(0, noise_std) to add to special token embeddings
     noise_std: float = 1.0
-    # If True, request hidden states from SGLang for computing reward bonus
-    return_hidden_states: bool = False
+    # If True, compute hidden state reward bonus via actor model forward pass
+    use_hidden_state_reward: bool = False
     # Alpha coefficient for hidden state reward bonus: reward += alpha * (z · eos) * 0.1
     hidden_state_reward_alpha: float = 0.1
     # end_modify

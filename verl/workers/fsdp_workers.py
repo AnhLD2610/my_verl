@@ -924,7 +924,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # start_modify: compute input_embeds with noise before offloading model
         use_input_embeds = getattr(self.config.rollout, "use_input_embeds", False)
         if use_input_embeds and self._is_actor:
-            from verl.workers.rollout.sglang_rollout.sglang_rollout import _compute_embeds_with_noise
+            from verl.workers.rollout.vllm_rollout.vllm_rollout_spmd import _compute_embeds_with_noise
             
             special_token_id = getattr(self.config.rollout, "special_token_id", None)
             noise_std = getattr(self.config.rollout, "noise_std", 1.0)
@@ -1019,6 +1019,120 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
         return output
+
+    # start_modify: add method to compute hidden state reward bonus
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_compute_hidden_bonus")
+    def compute_hidden_state_bonus(self, data: DataProto):
+        """
+        Compute reward bonus based on hidden states of special token and EOS token.
+        bonus = alpha * (z · eos) * 0.1
+        
+        Replay the same noise that was used during generation to get consistent z.
+        
+        Args:
+            data: DataProto containing input_ids, attention_mask, and config in meta_info
+                  Required meta_info: special_token_id, eos_token_id, alpha, pad_token_id
+                  Required batch: noise_tensor (from rollout)
+        
+        Returns:
+            DataProto with "hidden_state_bonus" tensor of shape (batch_size,)
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        special_token_id = data.meta_info.get("special_token_id")
+        eos_token_id = data.meta_info.get("eos_token_id")
+        alpha = data.meta_info.get("alpha", 0.1)
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+        
+        input_ids = data.batch["input_ids"]  # (batch_size, seq_len) - prompt + response
+        attention_mask = data.batch["attention_mask"]
+        noise_tensor = data.batch.get("noise_tensor", None)  # (batch_size, hidden_dim)
+        
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+        bonus = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        
+        # Forward pass with hidden states
+        with torch.no_grad():
+            self.actor.actor_module.eval()
+            
+            # start_modify: replay noise if available
+            if noise_tensor is not None:
+                # Get embedding layer and compute embeddings
+                embed_layer = self.actor.actor_module.get_input_embeddings()
+                inputs_embeds = embed_layer(input_ids)  # (batch_size, seq_len, hidden_dim)
+                
+                # Add the saved noise to special token positions
+                noise_tensor = noise_tensor.to(device=device, dtype=inputs_embeds.dtype)
+                for i in range(batch_size):
+                    special_positions = (input_ids[i] == special_token_id).nonzero(as_tuple=True)[0]
+                    if len(special_positions) > 0:
+                        pos = special_positions[0].item()
+                        inputs_embeds[i, pos] = inputs_embeds[i, pos] + noise_tensor[i]
+                
+                # Forward with inputs_embeds instead of input_ids
+                outputs = self.actor.actor_module(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+            else:
+                # No noise to replay - forward normally
+                outputs = self.actor.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+            # end_modify
+            
+            hidden_states = outputs.hidden_states[-1]  # Last layer: (batch_size, seq_len, hidden_dim)
+            self.actor.actor_module.train()
+        
+        # Compute bonus for each sample
+        for i in range(batch_size):
+            # Find special token position (first occurrence)
+            special_positions = (input_ids[i] == special_token_id).nonzero(as_tuple=True)[0]
+            if len(special_positions) == 0:
+                continue
+            z_idx = special_positions[0].item()
+            
+            # Find EOS position (last non-pad token or last EOS)
+            eos_positions = (input_ids[i] == eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                eos_idx = eos_positions[-1].item()
+            else:
+                # No EOS found, use last non-pad token
+                non_pad = (input_ids[i] != pad_token_id).nonzero(as_tuple=True)[0]
+                if len(non_pad) == 0:
+                    continue
+                eos_idx = non_pad[-1].item()
+            
+            # Extract hidden states and compute dot product
+            z = hidden_states[i, z_idx]  # (hidden_dim,)
+            eos_hs = hidden_states[i, eos_idx]  # (hidden_dim,)
+            dot_product = torch.dot(z.flatten(), eos_hs.flatten())
+            bonus[i] = alpha * dot_product * 0.1
+        
+        output = DataProto.from_dict(
+            tensors={"hidden_state_bonus": bonus.cpu()},
+            meta_info={"alpha": alpha},
+        )
+        
+        # Cleanup
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_hidden_state_bonus", logger=logger)
+
+        return output
+    # end_modify
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")

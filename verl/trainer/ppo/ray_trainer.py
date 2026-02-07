@@ -1158,23 +1158,35 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        # start_modify: add hidden state reward bonus
-                        # Check if hidden_state_reward_bonus exists in gen_batch_output
-                        if "hidden_state_reward_bonus" in gen_batch_output.meta_info:
-                            hidden_bonus = gen_batch_output.meta_info["hidden_state_reward_bonus"]
-                            if hidden_bonus is not None:
-                                # Add bonus to the last position of reward (outcome reward position)
-                                # reward_tensor shape: (batch_size, response_length)
-                                # bonus shape: (batch_size,)
+                        # start_modify: compute hidden state bonus using actor model (same weights as vLLM)
+                        # This happens BEFORE update_actor, so actor model has same weights as vLLM
+                        use_hidden_state_reward = self.config.actor_rollout_ref.rollout.get("use_hidden_state_reward", False)
+                        if use_hidden_state_reward and "noise_tensor" in batch.batch:
+                            special_token_id = self.config.actor_rollout_ref.rollout.get("special_token_id", None)
+                            alpha = self.config.actor_rollout_ref.rollout.get("hidden_state_reward_alpha", 0.1)
+                            if special_token_id is not None:
+                                # Prepare data for hidden state computation
+                                hidden_data = DataProto(
+                                    batch=batch.batch,
+                                    meta_info={
+                                        "special_token_id": special_token_id,
+                                        "eos_token_id": batch.meta_info.get("eos_token_id", 2),
+                                        "alpha": alpha,
+                                        "pad_token_id": batch.meta_info.get("pad_token_id", 0),
+                                    }
+                                )
+                                with marked_timer("hidden_bonus", timing_raw, color="purple"):
+                                    hidden_output = self.actor_rollout_wg.compute_hidden_state_bonus(hidden_data)
+                                hidden_bonus = hidden_output.batch["hidden_state_bonus"]
                                 hidden_bonus = hidden_bonus.to(reward_tensor.device)
-                                # Find last valid position for each sample using response_mask
+                                
+                                # Add bonus to the last token position of response
                                 response_mask = batch.batch["response_mask"]
-                                # Add bonus to the last token position
                                 last_positions = response_mask.sum(dim=-1).long() - 1
                                 last_positions = last_positions.clamp(min=0)
                                 for i in range(reward_tensor.shape[0]):
                                     batch.batch["token_level_scores"][i, last_positions[i]] += hidden_bonus[i]
-                                # Log the bonus for debugging
+                                
                                 print(f"[Hidden State Bonus] Added mean={hidden_bonus.mean().item():.4f} to rewards")
                         # end_modify
 

@@ -108,6 +108,71 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
     return token_ids
 
 
+# start_modify: helper function for embedding with noise injection for vLLM
+def _compute_embeds_with_noise(
+    embed_layer: torch.nn.Module,
+    input_ids: torch.Tensor,
+    special_token_id: int,
+    noise_std: float = 1.0,
+    pad_token_id: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """
+    Compute embeddings for input_ids and add Gaussian noise N(0, noise_std) 
+    to embeddings at positions of special_token_id.
+    
+    Args:
+        embed_layer: The embedding layer from the model
+        input_ids: Tensor of shape (batch_size, seq_len) with left-padding
+        special_token_id: Token ID to inject noise into
+        noise_std: Standard deviation of the Gaussian noise
+        pad_token_id: Padding token ID to skip
+        
+    Returns:
+        Tuple of:
+        - List of embedding tensors (one per sample, without padding)
+        - Noise tensor of shape (batch_size, hidden_dim) - the noise added to special token
+    """
+    # Compute embeddings: (batch_size, seq_len, hidden_dim)
+    with torch.no_grad():
+        inputs_embeds = embed_layer(input_ids)
+    
+    batch_size, seq_len, hidden_dim = inputs_embeds.shape
+    
+    # Find positions of special token
+    special_mask = (input_ids == special_token_id)  # (batch_size, seq_len)
+    
+    # Store the noise added to special token for each sample
+    noise_per_sample = torch.zeros(batch_size, hidden_dim, device=input_ids.device, dtype=inputs_embeds.dtype)
+    
+    # Sample noise and add to special token positions
+    if special_mask.any():
+        # Generate noise for special token positions only
+        for i in range(batch_size):
+            special_positions = special_mask[i].nonzero(as_tuple=True)[0]
+            if len(special_positions) > 0:
+                pos = special_positions[0].item()  # first special token position
+                noise = torch.randn(hidden_dim, device=input_ids.device, dtype=inputs_embeds.dtype) * noise_std
+                inputs_embeds[i, pos] = inputs_embeds[i, pos] + noise
+                noise_per_sample[i] = noise
+    
+    # Convert to list format (remove padding for each sample)
+    result = []
+    for i in range(batch_size):
+        # Remove left padding
+        non_pad_mask = (input_ids[i] != pad_token_id)
+        non_pad_indices = torch.nonzero(non_pad_mask, as_tuple=False)
+        if len(non_pad_indices) > 0:
+            start_idx = non_pad_indices[0][0].item()
+            embed_no_pad = inputs_embeds[i, start_idx:, :]  # (valid_seq_len, hidden_dim)
+        else:
+            embed_no_pad = inputs_embeds[i]
+        
+        result.append(embed_no_pad)
+    
+    return result, noise_per_sample
+# end_modify
+
+
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
@@ -228,6 +293,10 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        # start_modify: add enable_prompt_embeds for noise injection feature
+        enable_prompt_embeds = config.get("use_input_embeds", False)
+        # end_modify
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -247,6 +316,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            enable_prompt_embeds=enable_prompt_embeds,  # start_modify: enable prompt embeds
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
@@ -329,25 +399,59 @@ class vLLMRollout(BaseRollout):
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
-        if "multi_modal_data" in non_tensor_batch:
-            vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
-            ):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+        # start_modify: support input_embeds with noise injection
+        use_input_embeds = self.config.get("use_input_embeds", False)
+        special_token_id = self.config.get("special_token_id", None)
+        noise_std = self.config.get("noise_std", 1.0)
+        noise_tensor = None  # Will store noise for replay during hidden state computation
+        
+        if use_input_embeds and special_token_id is not None:
+            # Get embedding layer from vLLM model
+            embed_layer = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner.model.get_input_embeddings()
+            
+            # Compute embeddings with noise injection - now returns (embeds_list, noise_tensor)
+            prompt_embeds_list, noise_tensor = _compute_embeds_with_noise(
+                embed_layer=embed_layer,
+                input_ids=idx,
+                special_token_id=special_token_id,
+                noise_std=noise_std,
+                pad_token_id=self.pad_token_id,
+            )
+            
+            # Build vllm_inputs with prompt_embeds instead of prompt_token_ids
+            if "multi_modal_data" in non_tensor_batch:
+                vllm_inputs = []
+                for prompt_embeds, multi_modal_data in zip(
+                    prompt_embeds_list, non_tensor_batch.pop("multi_modal_data"), strict=True
+                ):
+                    vllm_inputs.append({"prompt_embeds": prompt_embeds, "multi_modal_data": multi_modal_data})
+                non_tensor_batch.pop("raw_prompt_ids", None)
+            else:
+                vllm_inputs = [{"prompt_embeds": embeds} for embeds in prompt_embeds_list]
+                non_tensor_batch.pop("raw_prompt_ids", None)
+            
+            logger.info(f"Using input_embeds with noise_std={noise_std} for special_token_id={special_token_id}")
         else:
-            vllm_inputs = [
-                {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
-            ]
+            # Original path: use prompt_token_ids
+            if "multi_modal_data" in non_tensor_batch:
+                vllm_inputs = []
+                for raw_prompt_ids, multi_modal_data in zip(
+                    non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
+                ):
+                    vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+            else:
+                vllm_inputs = [
+                    {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
+                ]
 
-        for input_data in vllm_inputs:
-            # Ensure token IDs are lists or numpy arrays
-            if not isinstance(input_data["prompt_token_ids"], list | np.ndarray):
-                raise TypeError(
-                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
-                )
-
-            input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+            for input_data in vllm_inputs:
+                # Ensure token IDs are lists or numpy arrays
+                if not isinstance(input_data["prompt_token_ids"], list | np.ndarray):
+                    raise TypeError(
+                        f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
+                    )
+                input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+        # end_modify
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -381,7 +485,7 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                prompts=vllm_inputs,
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
@@ -444,6 +548,11 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        
+        # start_modify: save noise tensor for replay during hidden state computation (done in actor model)
+        if noise_tensor is not None:
+            batch["noise_tensor"] = noise_tensor.cpu()
+        # end_modify
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
